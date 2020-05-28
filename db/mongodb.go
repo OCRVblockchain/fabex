@@ -19,6 +19,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -38,6 +39,8 @@ type DBmongo struct {
 	Instance   *mongo.Client
 }
 
+const ERR_NO_DOCUMENTS = "mongo: no documents in result"
+
 func CreateDBConfMongo(host string, port int, user, password, dbname, collection string) *DBmongo {
 	client, err := mongo.NewClient(options.Client().ApplyURI(fmt.Sprintf("mongodb://%s:%s@%s:%d", user, password, host, port)))
 	if err != nil {
@@ -50,14 +53,11 @@ func (db *DBmongo) Connect() error {
 	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
 	err := db.Instance.Connect(ctx)
 	if err != nil {
-		log.Println("Mongodb connection failed: %s", err)
 		return err
 	}
 	ctx, _ = context.WithTimeout(context.Background(), 5*time.Second)
 	err = db.Instance.Ping(ctx, readpref.Primary())
-
-	log.Println("Connected to MongoDB successfully")
-	return nil
+	return err
 }
 
 func (db *DBmongo) Insert(tx Tx) error {
@@ -74,11 +74,9 @@ func (db *DBmongo) Insert(tx Tx) error {
 func (db *DBmongo) getByFilter(filterValue interface{}) ([]Tx, error) {
 	collection := db.Instance.Database(db.DBname).Collection(db.Collection)
 	filter := filterValue
-
 	ctx := context.Background()
 	cur, err := collection.Find(ctx, filter)
 	if err != nil {
-		fmt.Println(err)
 		return nil, err
 	}
 
@@ -89,7 +87,6 @@ func (db *DBmongo) getByFilter(filterValue interface{}) ([]Tx, error) {
 		var result Tx
 		err = cur.Decode(&result)
 		if err != nil {
-			fmt.Println("ERR: ", err)
 			return nil, err
 		}
 		results = append(results, result)
@@ -129,8 +126,10 @@ func (db *DBmongo) GetLastEntry() (Tx, error) {
 
 	var tx Tx
 	err := collection.FindOne(ctx, bson.D{}, opts).Decode(&tx)
-	if err != nil {
-		log.Fatal(err)
+	if err != nil && err.Error() != ERR_NO_DOCUMENTS {
+		return tx, err
+	} else if err != nil && err.Error() == ERR_NO_DOCUMENTS {
+		return tx, errors.New(NOT_FOUND_ERR)
 	}
 
 	return tx, nil

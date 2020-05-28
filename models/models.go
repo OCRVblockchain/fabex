@@ -17,15 +17,15 @@
 package models
 
 import (
+	"github.com/hyperledger-labs/fabex/db"
+	"github.com/hyperledger-labs/fabex/ledgerclient"
 	"github.com/hyperledger/fabric-sdk-go/pkg/client/channel"
-	"github.com/hyperledger/fabric-sdk-go/pkg/client/ledger"
-	"github.com/vadiminshakov/fabex/db"
 )
 
 type Fabex struct {
-	Db            db.Manager
+	Db            db.Storage
 	ChannelClient *channel.Client
-	LedgerClient  *ledger.Client
+	LedgerClient  *ledgerclient.CustomLedgerClient
 }
 
 type Mongo struct {
@@ -58,11 +58,16 @@ type Fabric struct {
 	ConnectionProfile string
 }
 
+type UI struct {
+	Port string
+}
+
 type Config struct {
 	Mongo
 	Cassandra
 	Fabric
 	GRPCServer
+	UI
 }
 
 type Chaincode struct {
@@ -76,16 +81,16 @@ type Block struct {
 	PreviousHash string `json:"previoushash"`
 	Blocknum     uint64 `json:"blocknum"`
 	Txs          []Tx   `json:"txs"`
-	Time         int64  `json:"time" bson:"Time"`
 }
 
 type Tx struct {
 	Txid           string `json:"txid"`
-	KW             []KW
+	KV             []KV
 	ValidationCode int32 `json:"validationcode"`
+	Time           int64 `json:"time" bson:"Time"`
 }
 
-type KW struct {
+type KV struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }

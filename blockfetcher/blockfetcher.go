@@ -14,6 +14,7 @@
    limitations under the License.
 */
 
+// Package blockfetcher provides functionality for fetching blocks from blockchain
 package blockfetcher
 
 import (
@@ -21,21 +22,31 @@ import (
 	"encoding/json"
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
+	"github.com/hyperledger-labs/fabex/db"
+	"github.com/hyperledger-labs/fabex/models"
 	"github.com/hyperledger/fabric-sdk-go/pkg/client/ledger"
+	"github.com/hyperledger/fabric/common/configtx"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
+	fabcommon "github.com/hyperledger/fabric/protos/common"
 	"github.com/hyperledger/fabric/protos/ledger/rwset"
 	"github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protos/utils"
-	"github.com/vadiminshakov/fabex/db"
-	"github.com/vadiminshakov/fabex/models"
+	"github.com/pkg/errors"
 	"strings"
 )
 
+// LedgerClient interface used for dependency injection of Fabric ledger client
+type LedgerClient interface {
+	QueryBlock(blockNumber uint64, options ...ledger.RequestOption) (*fabcommon.Block, error)
+}
+
+// CustomBlock stores slice of transactions (with block data)
 type CustomBlock struct {
 	Txs []db.Tx
 }
 
-func GetBlock(ledgerClient *ledger.Client, blocknum uint64) (*CustomBlock, error) {
+// GetBlock gets information about specified block with blocknum number
+func GetBlock(ledgerClient LedgerClient, blocknum uint64) (*CustomBlock, error) {
 	customBlock := &CustomBlock{}
 
 	block, err := ledgerClient.QueryBlock(blocknum)
@@ -76,7 +87,7 @@ func GetBlock(ledgerClient *ledger.Client, blocknum uint64) (*CustomBlock, error
 		}
 
 		// get timestamp
-		timeInBlock, err := ptypes.Timestamp(channelHeader.Timestamp)
+		txtime, err := ptypes.Timestamp(channelHeader.Timestamp)
 		if err != nil {
 			return nil, err
 		}
@@ -110,11 +121,59 @@ func GetBlock(ledgerClient *ledger.Client, blocknum uint64) (*CustomBlock, error
 			return nil, err
 		}
 
-		for _, nsRwSet := range txRWSet.NsRwSets {
+		if len(txRWSet.NsRwSets) == 0 {
+			// cast "github.com/hyperledger/fabric-sdk-go/third_party/github.com/hyperledger/fabric/protos/common".Block to
+			// "github.com/hyperledger/fabric/protos/common".Block
+			configEnvelope, err := ConfigEnvelopeFromBlock(block)
+			if err != nil {
+				return nil, err
+			}
 
+			payload, err := utils.ExtractPayload(configEnvelope)
+			if err != nil {
+				return nil, errors.Wrap(err, "failed to extract payload from config envelope")
+			}
+
+			// get config update
+			configUpdate, err := configtx.UnmarshalConfigUpdateFromPayload(payload)
+			if err != nil {
+				return nil, errors.Wrap(err, "could not read config update")
+			}
+
+			var stringedPayload []models.Chaincode
+			ReadSet, err := json.Marshal(configUpdate.ReadSet)
+			if err != nil {
+				return nil, err
+			}
+			WriteSet, err := json.Marshal(configUpdate.WriteSet)
+			if err != nil {
+				return nil, err
+			}
+			stringedPayload = append(stringedPayload, models.Chaincode{Key: "ChannelId", Value: configUpdate.ChannelId})
+			stringedPayload = append(stringedPayload, models.Chaincode{Key: "ReadSet", Value: string(ReadSet)})
+			stringedPayload = append(stringedPayload, models.Chaincode{Key: "WriteSet", Value: string(WriteSet)})
+
+			jsonPayload, err := json.Marshal(stringedPayload)
+			if err != nil {
+				return nil, err
+			}
+
+			tx := db.Tx{
+				channelHeader.ChannelId,
+				TxId,
+				hash,
+				previoushash,
+				blocknum,
+				string(jsonPayload),
+				validationCode,
+				txtime.Unix(),
+			}
+			customBlock.Txs = append(customBlock.Txs, tx)
+
+		}
+		for _, nsRwSet := range txRWSet.NsRwSets {
 			// get only those txs that changes state
 			if len(nsRwSet.KvRwSet.Writes) != 0 {
-
 				var stringedPayload []models.Chaincode
 				for _, write := range nsRwSet.KvRwSet.Writes {
 					stringedPayload = append(stringedPayload, models.Chaincode{Key: write.Key, Value: string(write.Value)})
@@ -132,12 +191,48 @@ func GetBlock(ledgerClient *ledger.Client, blocknum uint64) (*CustomBlock, error
 					blocknum,
 					string(jsonPayload),
 					validationCode,
-					timeInBlock.Unix(),
+					txtime.Unix(),
 				}
 				customBlock.Txs = append(customBlock.Txs, tx)
-
 			}
 		}
 	}
+
 	return customBlock, nil
+}
+
+// ConfigEnvelopeFromBlock extracts configuration envelope from the block based on the
+// config type, i.e. HeaderType_ORDERER_TRANSACTION or HeaderType_CONFIG
+func ConfigEnvelopeFromBlock(block *fabcommon.Block) (*fabcommon.Envelope, error) {
+	if block == nil {
+		return nil, errors.New("nil block")
+	}
+
+	envelope, err := utils.ExtractEnvelope(block, 0)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to extract envelope from the block")
+	}
+
+	channelHeader, err := utils.ChannelHeader(envelope)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot extract channel header")
+	}
+
+	switch channelHeader.Type {
+	case int32(fabcommon.HeaderType_ORDERER_TRANSACTION):
+		payload, err := utils.UnmarshalPayload(envelope.Payload)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to unmarshal envelope to extract config payload for orderer transaction")
+		}
+		configEnvelop, err := utils.UnmarshalEnvelope(payload.Data)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to unmarshal config envelope for orderer type transaction")
+		}
+
+		return configEnvelop, nil
+	case int32(fabcommon.HeaderType_CONFIG):
+		return envelope, nil
+	default:
+		return nil, errors.Errorf("unexpected header type: %v", channelHeader.Type)
+	}
 }

@@ -20,6 +20,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/hyperledger-labs/fabex/blockfetcher"
+	"github.com/hyperledger-labs/fabex/db"
+	"github.com/hyperledger-labs/fabex/helpers"
+	"github.com/hyperledger-labs/fabex/ledgerclient"
+	"github.com/hyperledger-labs/fabex/models"
+	pb "github.com/hyperledger-labs/fabex/proto"
+	"github.com/hyperledger-labs/fabex/rest"
 	"github.com/hyperledger/fabric-sdk-go/pkg/client/channel"
 	"github.com/hyperledger/fabric-sdk-go/pkg/client/ledger"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/logging"
@@ -28,11 +35,6 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
-	"github.com/vadiminshakov/fabex/blockfetcher"
-	"github.com/vadiminshakov/fabex/db"
-	"github.com/vadiminshakov/fabex/helpers"
-	"github.com/vadiminshakov/fabex/models"
-	pb "github.com/vadiminshakov/fabex/proto"
 	"google.golang.org/grpc"
 	"net"
 	"os"
@@ -42,6 +44,12 @@ var (
 	lvl          = logging.INFO
 	globalConfig models.Config
 )
+
+type FabexServer struct {
+	Address string
+	Port    string
+	Conf    *models.Fabex
+}
 
 func main() {
 
@@ -53,6 +61,7 @@ func main() {
 	confpath := flag.String("configpath", "./", "path to YAML config")
 	confname := flag.String("configname", "config", "name of YAML config")
 	databaseSelected := flag.String("db", "mongo", "select database")
+	ui := flag.Bool("ui", true, "with UI or without")
 
 	flag.Parse()
 
@@ -99,7 +108,7 @@ func main() {
 	}
 
 	// choose database
-	var dbInstance db.Manager
+	var dbInstance db.Storage
 	switch *databaseSelected {
 	case "mongo":
 		dbInstance = db.CreateDBConfMongo(globalConfig.Mongo.Host, globalConfig.Mongo.Port, globalConfig.Mongo.Dbuser, globalConfig.Mongo.Dbsecret, globalConfig.Mongo.Dbname, globalConfig.Mongo.Collection)
@@ -108,24 +117,25 @@ func main() {
 	}
 
 	var fabex *models.Fabex
-	if *task != "initdb" {
-		err := dbInstance.Connect()
-		if err != nil {
-			log.Fatal("DB connection failed:", err.Error())
-		}
+
+	err = dbInstance.Connect()
+	if err != nil {
+		log.Fatal("DB connection failed:", err.Error())
 	}
-	fabex = &models.Fabex{dbInstance, channelclient, ledgerClient}
+	log.Println("Connected to database successfully")
+
+	fabex = &models.Fabex{dbInstance, channelclient, &ledgerclient.CustomLedgerClient{ledgerClient}}
 
 	switch *task {
 	case "channelinfo":
-		resp, err := helpers.QueryChannelInfo(fabex.LedgerClient)
+		resp, err := helpers.QueryChannelInfo(fabex.LedgerClient.Client)
 		if err != nil {
 			log.Fatalf("Can't query blockchain info: %s", err)
 		}
 		log.Printf("BlockChainInfo: %v\nEndorser: %v\nStatus: %v\n", resp.BCI, resp.Endorser, resp.Status)
 
 	case "channelconfig":
-		err = helpers.QueryChannelConfig(fabex.LedgerClient)
+		err = helpers.QueryChannelConfig(fabex.LedgerClient.Client)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -194,32 +204,29 @@ func main() {
 
 	case "grpc":
 		serv := NewFabexServer(globalConfig.GRPCServer.Host, globalConfig.GRPCServer.Port, fabex)
+
+		// rest
+		go rest.Run(serv.Conf.Db, globalConfig.UI.Port, *ui)
+		// grpc
 		StartGrpcServ(serv, fabex)
 	}
 }
 
-type fabexServer struct {
-	Address string
-	Port    string
-	Conf    *models.Fabex
+func NewFabexServer(addr string, port string, conf *models.Fabex) *FabexServer {
+	return &FabexServer{addr, port, conf}
 }
 
-func NewFabexServer(addr string, port string, conf *models.Fabex) *fabexServer {
-	return &fabexServer{addr, port, conf}
-}
-
-func (s *fabexServer) Explore(req *pb.RequestRange, stream pb.Fabex_ExploreServer) error {
+func (s *FabexServer) Explore(req *pb.RequestRange, stream pb.Fabex_ExploreServer) error {
 	log.Printf("Start stream from %d block", req.Startblock)
 	// set blocks counter to latest saved in db block number value
-	var blockCounter uint64 = uint64(req.Startblock)
+	blockCounter := req.Startblock
 
 	// insert missing blocks/txs into db
-	for blockCounter <= uint64(req.Endblock) {
-		customBlock, err := blockfetcher.GetBlock(s.Conf.LedgerClient, blockCounter)
+	for blockCounter <= req.Endblock {
+		customBlock, err := blockfetcher.GetBlock(s.Conf.LedgerClient, uint64(blockCounter))
 		if err != nil {
 			return errors.Wrap(err, "GetBlock error")
 		}
-
 		if customBlock != nil {
 			for _, queryResult := range customBlock.Txs {
 				stream.Send(&pb.Entry{Channelid: queryResult.ChannelId, Txid: queryResult.Txid, Hash: queryResult.Hash, Previoushash: queryResult.PreviousHash, Blocknum: queryResult.Blocknum, Payload: queryResult.Payload, Time: queryResult.Time})
@@ -231,47 +238,41 @@ func (s *fabexServer) Explore(req *pb.RequestRange, stream pb.Fabex_ExploreServe
 	return nil
 }
 
-func (s *fabexServer) GetByTxId(req *pb.Entry, stream pb.Fabex_GetByTxIdServer) error {
+func (s *FabexServer) Get(req *pb.Entry, stream pb.Fabex_GetServer) error {
+	switch {
+	case req.Txid != "":
+		QueryResults, err := s.Conf.Db.GetByTxId(req.Txid)
+		if err != nil {
+			return err
+		}
 
-	QueryResults, err := s.Conf.Db.GetByTxId(req.Txid)
-	if err != nil {
-		return err
-	}
+		for _, queryResult := range QueryResults {
+			stream.Send(&pb.Entry{Channelid: queryResult.ChannelId, Txid: queryResult.Txid, Hash: queryResult.Hash, Previoushash: queryResult.PreviousHash, Blocknum: queryResult.Blocknum, Payload: queryResult.Payload, Time: queryResult.Time})
+		}
+	case req.Blocknum != 0:
+		QueryResults, err := s.Conf.Db.GetByBlocknum(req.Blocknum)
+		if err != nil {
+			return err
+		}
 
-	for _, queryResult := range QueryResults {
-		stream.Send(&pb.Entry{Channelid: queryResult.ChannelId, Txid: queryResult.Txid, Hash: queryResult.Hash, Previoushash: queryResult.PreviousHash, Blocknum: queryResult.Blocknum, Payload: queryResult.Payload, Time: queryResult.Time})
-	}
+		for _, queryResult := range QueryResults {
+			stream.Send(&pb.Entry{Channelid: queryResult.ChannelId, Txid: queryResult.Txid, Hash: queryResult.Hash, Previoushash: queryResult.PreviousHash, Blocknum: queryResult.Blocknum, Payload: queryResult.Payload, Time: queryResult.Time})
+		}
+	case req.Payload != "":
+		QueryResults, err := s.Conf.Db.GetBlockInfoByPayload(req.Payload)
+		if err != nil {
+			return err
+		}
 
-	return nil
-}
-
-func (s *fabexServer) GetByBlocknum(req *pb.Entry, stream pb.Fabex_GetByBlocknumServer) error {
-	QueryResults, err := s.Conf.Db.GetByBlocknum(req.Blocknum)
-	if err != nil {
-		return err
-	}
-
-	for _, queryResult := range QueryResults {
-		stream.Send(&pb.Entry{Channelid: queryResult.ChannelId, Txid: queryResult.Txid, Hash: queryResult.Hash, Previoushash: queryResult.PreviousHash, Blocknum: queryResult.Blocknum, Payload: queryResult.Payload, Time: queryResult.Time})
-	}
-
-	return nil
-}
-
-func (s *fabexServer) GetBlockInfoByPayload(req *pb.Entry, stream pb.Fabex_GetBlockInfoByPayloadServer) error {
-	QueryResults, err := s.Conf.Db.GetBlockInfoByPayload(req.Payload)
-	if err != nil {
-		return err
-	}
-
-	for _, queryResult := range QueryResults {
-		stream.Send(&pb.Entry{Channelid: queryResult.ChannelId, Txid: queryResult.Txid, Hash: queryResult.Hash, Previoushash: queryResult.PreviousHash, Blocknum: queryResult.Blocknum, Payload: queryResult.Payload, Time: queryResult.Time})
+		for _, queryResult := range QueryResults {
+			stream.Send(&pb.Entry{Channelid: queryResult.ChannelId, Txid: queryResult.Txid, Hash: queryResult.Hash, Previoushash: queryResult.PreviousHash, Blocknum: queryResult.Blocknum, Payload: queryResult.Payload, Time: queryResult.Time})
+		}
 	}
 
 	return nil
 }
 
-func StartGrpcServ(serv *fabexServer, fabex *models.Fabex) {
+func StartGrpcServ(serv *FabexServer, fabex *models.Fabex) {
 
 	grpcServer := grpc.NewServer()
 	pb.RegisterFabexServer(grpcServer, serv)
